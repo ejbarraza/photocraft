@@ -246,6 +246,11 @@ The desktop app also offers an authenticated, loopback-only control channel (`ph
 - **Clean-room:** implemented from public specs and observed behaviour only. No proprietary code, shaders or assets.
 - **Tested:** more than 1,700 tests, including PSD round trips, synthetic generators, compositor oracles and multi-depth checks.
 
+## Samples
+
+Before/after edits produced headlessly with `photocraft-cli` — see [samples/](samples/)
+for the images and the exact commands to reproduce them.
+
 ## Get started
 
 ```sh
