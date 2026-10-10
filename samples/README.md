@@ -35,6 +35,8 @@ inspecting the intermediate result).
 
 ![Shepherd removal before/after](object-removal-shepherd-before-after.png)
 
+Source footage: [A Shepherd Walking With His Flock of Sheep](https://www.pexels.com/video/a-shepherd-walking-with-his-flock-of-sheep-14350944/) on Pexels.
+
 ```sh
 # Pass 1: body + staff, donor is the shrubbery to the right
 photocraft-cli run field.png \
