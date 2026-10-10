@@ -29,3 +29,26 @@ What each step does:
 Produced with `photocraft-cli` (v0.6.0). Every action above is a command from the
 engine registry, so the same edit runs identically from the UI, a script, or an
 MCP-driven agent.
+
+## Selfie white-balance correction
+
+Indoor tungsten lighting had thrown a warm yellow cast over this selfie. Three
+commands: cool the white balance toward neutral, a gentle S-curve for depth, and
+a light smart-sharpen pass.
+
+![Selfie white-balance before/after](selfie-white-balance-before-after.png)
+
+```sh
+photocraft-cli run selfie.jpg \
+  --cmd image.adjustments.colorBalance \
+  --params '{"midtones":[0,0,22],"shadows":[0,0,10],"highlights":[0,0,12],"preserveLuminosity":true}' \
+  --cmd image.adjustments.curves \
+  --params '{"points":[[0,0],[64,56],[128,128],[192,200],[255,255]]}' \
+  --cmd filter.sharpen.smartSharpen \
+  --params '{"amount":70,"radius":1.0,"reduceNoise":12}' \
+  --out selfie-graded.png
+```
+
+Note: `image.adjustments.colorBalance` follows Photoshop's slider convention —
+negative values on the yellow-blue axis add yellow, positive values add blue.
+Cooling a warm cast means pushing positive.
