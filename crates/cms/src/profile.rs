@@ -147,6 +147,11 @@ pub struct Lut {
     pub stages: Vec<Stage>,
 }
 
+/// Largest colour difference (CIE ΔE*ab) for which [`Profile::same_colors`] treats two profiles
+/// as one colour space: invisible, yet 20× what re-encoding a profile costs (sRGB as v2 tables
+/// against v4 parametric curves differs by 0.025). Moving sRGB's red primary 2% costs 1.0.
+pub const SAME_COLORS_MAX_DELTA_E: f64 = 0.5;
+
 /// A parsed ICC profile.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Profile {
@@ -213,6 +218,43 @@ impl Profile {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             self.to_bytes().hash(&mut h);
             h.finish()
+        })
+    }
+
+    /// Whether `self` and `other` describe the same colours: same colour space, and every sample
+    /// of a device-value grid has the same colour through both (relative colorimetric, within
+    /// [`SAME_COLORS_MAX_DELTA_E`]). Different encodings of one space are the same colours: the
+    /// sRGB IEC61966-2.1 Photoshop embeds (v2, 1024-entry tables) and the built-in sRGB (v4,
+    /// parametric curves) differ in every byte. Colours are compared rather than round-tripped
+    /// because CMYK → PCS → CMYK is not an identity even through a single profile.
+    pub fn same_colors(&self, other: &Profile) -> bool {
+        if self.content_hash() == other.content_hash() {
+            return true;
+        }
+        let n = self.channels();
+        if self.color_space != other.color_space || n == 0 || n > 4 {
+            return false;
+        }
+        let lab = crate::builtin::Builtin::LabD50.profile();
+        let to_lab = |p: &Profile| crate::transform::Transform::new(p, lab, Intent::RelativeColorimetric, false);
+        let (Ok(a), Ok(b)) = (to_lab(self), to_lab(other)) else {
+            return false;
+        };
+        // 17 steps per channel catch a TRC that differs only in its toe; 9 keep CMYK at 6561 samples.
+        let steps: usize = if n <= 3 { 17 } else { 9 };
+        // Lab D50 is the PCS, normalised as in ICC v4.
+        let decode = |o: [f32; 3]| [f64::from(o[0]) * 100.0, f64::from(o[1]) * 255.0 - 128.0, f64::from(o[2]) * 255.0 - 128.0];
+        let mut input = [0f32; 4];
+        (0..steps.pow(n as u32)).all(|i| {
+            let mut k = i;
+            for v in input.iter_mut().take(n) {
+                *v = (k % steps) as f32 / (steps - 1) as f32;
+                k /= steps;
+            }
+            let (mut la, mut lb) = ([0f32; 3], [0f32; 3]);
+            a.eval(&input[..n], &mut la);
+            b.eval(&input[..n], &mut lb);
+            math::delta_e76(decode(la), decode(lb)) <= SAME_COLORS_MAX_DELTA_E
         })
     }
 
@@ -406,7 +448,8 @@ fn parse_profile(bytes: &[u8]) -> Result<Profile, CmsError> {
     let version = (r.u8(8)?, r.u8(9)?);
     let class = ProfileClass::from_sig(r.u32(12)?);
     let color_space = ColorSpace::from_sig(r.u32(16)?);
-    let pcs = match &r.u32(20)?.to_be_bytes() {
+    let pcs_sig = r.u32(20)?;
+    let pcs = match &pcs_sig.to_be_bytes() {
         b"Lab " => Pcs::Lab,
         _ => Pcs::Xyz,
     };
@@ -497,15 +540,18 @@ fn parse_profile(bytes: &[u8]) -> Result<Profile, CmsError> {
         bytes: None,
         hash: Default::default(),
     };
-    // Validate channel counts of LUTs against the header.
+    // Validate channel counts of LUTs against the header. A DeviceLink connects two device
+    // spaces: its header PCS field holds the output colour space (ICC.1:2010 §7.2.7), so a
+    // CMYK→CMYK link has a 4→4 AToB0.
     let dev = p.color_space.channels();
+    let conn = if p.class == ProfileClass::DeviceLink { ColorSpace::from_sig(pcs_sig).channels() } else { 3 };
     for l in p.a2b.iter().flatten() {
-        if dev != 0 && l.inputs != dev || l.outputs != 3 {
+        if dev != 0 && l.inputs != dev || conn != 0 && l.outputs != conn {
             return Err(CmsError::Invalid(format!("AToB tag has {}→{} channels for a {:?} profile", l.inputs, l.outputs, p.color_space)));
         }
     }
     for l in p.b2a.iter().flatten() {
-        if l.inputs != 3 || dev != 0 && l.outputs != dev {
+        if conn != 0 && l.inputs != conn || dev != 0 && l.outputs != dev {
             return Err(CmsError::Invalid(format!("BToA tag has {}→{} channels for a {:?} profile", l.inputs, l.outputs, p.color_space)));
         }
     }

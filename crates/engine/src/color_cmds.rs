@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use photocraft_cms::{Builtin, ColorSpace, GamutCheck, Intent, Lut3d, Profile, SampleKind, Transform};
 use photocraft_color::{Color, ColorMode, PixelFormat, SampleType};
-use photocraft_doc::{DocId, Document, Effect, Fill, FxPaint, Layer, LayerContent};
+use photocraft_doc::{DocId, Document, Duotone, Effect, Fill, FxPaint, Layer, LayerContent};
 use photocraft_raster::Surface;
 use serde_json::{Value, json};
 
@@ -199,9 +199,14 @@ pub struct ColorState {
     /// Edit › Color Settings (persisted with the preferences).
     pub settings: ColorSettings,
     proofs: HashMap<DocId, ProofView>,
-    /// The main display's ICC profile as read by the platform (used when Color Settings ›
-    /// Monitor Profile is `auto`; `None` = sRGB display).
-    pub monitor_profile: Option<Arc<Vec<u8>>>,
+    /// The displays and their ICC profiles as read by the platform, primary (menu-bar) display
+    /// first (used when Color Settings › Monitor Profile is `auto`; none = sRGB display).
+    pub displays: Vec<crate::display_color::Display>,
+    /// Whether `displays` was read, or why not (see [`ColorState::set_displays`]).
+    pub monitor_detection: crate::display_color::MonitorDetection,
+    /// The display showing the main window (set by the UI each frame; `None` = unknown, the
+    /// primary display). Other windows pass their own display to the `*_for` methods.
+    pub main_display: Option<u32>,
     display_cache: Mutex<HashMap<DisplayKey, Arc<Transform>>>,
     pub(crate) display: crate::display_color::DisplayCaches,
     /// View › 32-bit Preview Options per document.
@@ -243,11 +248,14 @@ impl ColorState {
         let embedded = doc.icc_profile.as_ref().and_then(|b| profile_from_bytes(b).ok()).filter(|p| p.color_space == space);
         match embedded {
             Some(emb) => {
-                let mismatch = emb.content_hash() != working.content_hash();
+                // Compared by colour, not bytes: Photoshop's sRGB IEC61966-2.1 is our working sRGB.
+                let mismatch = !emb.same_colors(&working);
                 let base = json!({"embedded": emb.description, "working": working.description, "mismatch": mismatch, "policy": policy.id()});
-                // 32-bit linear images (EXR/HDR are tagged linear sRGB on import) stay linear, as
-                // Photoshop keeps 32-bit documents in a linear version of the working space.
-                let linear_hdr = doc.depth == SampleType::F32 && emb.content_hash() == Builtin::LinearSrgb.profile().content_hash();
+                // 32-bit linear images (EXR/HDR are tagged linear sRGB or linear gray on import)
+                // stay linear, as Photoshop keeps 32-bit documents in a linear version of the
+                // working space.
+                let linear_hdr =
+                    doc.depth == SampleType::F32 && (emb.same_colors(Builtin::LinearSrgb.profile()) || emb.same_colors(photocraft_cms::builtin::linear_gray()));
                 if !mismatch || linear_hdr {
                     return merge(base, json!({"action": "kept"}));
                 }
@@ -282,8 +290,9 @@ impl ColorState {
         self.proofs.get(&doc).cloned().unwrap_or_else(|| ProofView { gamut_threshold: photocraft_cms::gamut::DEFAULT_THRESHOLD, ..Default::default() })
     }
 
-    /// The document's proofing state when it was ever changed (no default allocated).
-    pub(crate) fn proof_ref(&self, doc: DocId) -> Option<&ProofView> {
+    /// Borrow the document's proofing state without cloning its profile or allocating defaults.
+    /// `None` means the unchanged defaults documented by [`Self::proof`].
+    pub fn proof_ref(&self, doc: DocId) -> Option<&ProofView> {
         self.proofs.get(&doc)
     }
 
@@ -295,8 +304,13 @@ impl ColorState {
     /// the monitor, including the soft proof when View › Proof Colors is on. Cached per
     /// profile pair and proof settings.
     pub fn display_transform(&self, doc: &Document) -> Result<Arc<Transform>> {
-        let src = self.canvas_display(doc)?.source.clone();
-        let dst = self.monitor();
+        self.display_transform_for(doc, self.main_display)
+    }
+
+    /// [`ColorState::display_transform`] to `display`'s monitor profile.
+    pub fn display_transform_for(&self, doc: &Document, display: Option<u32>) -> Result<Arc<Transform>> {
+        let src = self.canvas_display_for(doc, display)?.source.clone();
+        let dst = self.monitor_for(display);
         let pv = self.proof(doc.id);
         let proof = pv.enabled.then(|| (pv.setup.profile.content_hash(), pv.setup.intent, pv.setup.bpc, pv.setup.simulate_paper));
         let key = (src.content_hash(), dst.content_hash(), proof);
@@ -321,15 +335,16 @@ impl ColorState {
     /// The display transform as an `size³` RGBA 3D LUT (upload with
     /// [`Lut3d::to_rgba16f_bytes`] and apply in the canvas shader).
     pub fn display_lut(&self, doc: &Document, size: usize) -> Result<Lut3d> {
-        self.display_lut_with(doc, size, true)
+        self.display_lut_with(doc, size, true, self.main_display)
     }
 
-    /// [`ColorState::display_lut`], with or without the 32-bit preview (exposure/gamma).
-    fn display_lut_with(&self, doc: &Document, size: usize, hdr: bool) -> Result<Lut3d> {
-        if let Some(lut) = crate::proof_sim::display_lut_with(self, doc, size, hdr)? {
+    /// [`ColorState::display_lut`], with or without the 32-bit preview (exposure/gamma), for
+    /// `display`.
+    fn display_lut_with(&self, doc: &Document, size: usize, hdr: bool, display: Option<u32>) -> Result<Lut3d> {
+        if let Some(lut) = crate::proof_sim::display_lut_with(self, doc, size, hdr, display)? {
             return Ok(lut);
         }
-        let t = self.display_transform(doc)?;
+        let t = self.display_transform_for(doc, display)?;
         Ok(Lut3d::from_transform(&t, size))
     }
 
@@ -345,24 +360,29 @@ impl ColorState {
     /// mapping canvas texture values to the monitor, whose alpha is 255 where the colour is out
     /// of the proof gamut (only with Gamut Warning on).
     pub fn canvas_lut(&self, doc: &Document, size: usize) -> Result<Option<Vec<u8>>> {
-        self.canvas_lut_with(doc, size, true)
+        self.canvas_lut_with(doc, size, true, self.main_display)
     }
 
     /// [`ColorState::canvas_lut`] without the 32-bit preview, which the GPU canvas shader applies
     /// itself (see [`ColorState::hdr_preview`]) so that 32-bit values above 1.0, kept by its float
     /// texture, are exposed into range rather than clipped by the LUT's 0..1 domain.
     pub fn gpu_canvas_lut(&self, doc: &Document, size: usize) -> Result<Option<Vec<u8>>> {
-        self.canvas_lut_with(doc, size, false)
+        self.gpu_canvas_lut_for(doc, size, self.main_display)
     }
 
-    fn canvas_lut_with(&self, doc: &Document, size: usize, hdr: bool) -> Result<Option<Vec<u8>>> {
+    /// [`ColorState::gpu_canvas_lut`] for a window on `display`.
+    pub fn gpu_canvas_lut_for(&self, doc: &Document, size: usize, display: Option<u32>) -> Result<Option<Vec<u8>>> {
+        self.canvas_lut_with(doc, size, false, display)
+    }
+
+    fn canvas_lut_with(&self, doc: &Document, size: usize, hdr: bool, on: Option<u32>) -> Result<Option<Vec<u8>>> {
         let size = size.max(2);
         let pv = self.proof(doc.id);
-        let display = self.canvas_display(doc)?;
+        let display = self.canvas_display_for(doc, on)?;
         if !pv.enabled && !pv.gamut_warning && !(hdr && crate::proof_sim::hdr_active(self, doc)) {
             return Ok(display.transform.as_ref().map(|t| Lut3d::from_transform(t, size).to_rgba8()));
         }
-        let lut = self.display_lut_with(doc, size, hdr)?;
+        let lut = self.display_lut_with(doc, size, hdr, on)?;
         let mut bytes = lut.to_rgba8();
         let check = if pv.gamut_warning { Some(GamutCheck::new(&display.source, &pv.setup.profile, pv.gamut_threshold).map_err(cms_err)?) } else { None };
         let s = (size - 1) as f32;
@@ -556,23 +576,24 @@ fn convert_color(c: &mut Color, from: ColorMode, to: ColorMode, t: &Transform) {
     c.c = nc;
 }
 
-fn convert_fill(f: &mut Fill, from: ColorMode, to: ColorMode, t: &Transform) {
+fn convert_fill(f: &mut Fill, cc: &mut dyn FnMut(&mut Color)) {
     match f {
-        Fill::Solid(c) => convert_color(c, from, to, t),
-        Fill::Gradient { stops, .. } => stops.iter_mut().for_each(|s| convert_color(&mut s.1, from, to, t)),
+        Fill::Solid(c) => cc(c),
+        Fill::Gradient { stops, .. } => stops.iter_mut().for_each(|s| cc(&mut s.1)),
         Fill::Pattern { .. } => {}
     }
 }
 
-fn convert_layer_colors(l: &mut Layer, from: ColorMode, to: ColorMode, t: &Transform) {
-    let mut cc = |c: &mut Color| convert_color(c, from, to, t);
+/// Applies `cc` to every colour value of `l` (fill, text, shape and effect colours), recursing
+/// into groups.
+fn convert_layer_colors(l: &mut Layer, cc: &mut dyn FnMut(&mut Color)) {
     let mut touched_fx = false;
     for e in &mut l.effects.items {
         touched_fx = true;
         match e {
             Effect::DropShadow(s) | Effect::InnerShadow(s) => cc(&mut s.color),
-            Effect::OuterGlow(g) | Effect::InnerGlow(g) => paint_colors(&mut g.paint, &mut cc),
-            Effect::Stroke(s) => paint_colors(&mut s.paint, &mut cc),
+            Effect::OuterGlow(g) | Effect::InnerGlow(g) => paint_colors(&mut g.paint, cc),
+            Effect::Stroke(s) => paint_colors(&mut s.paint, cc),
             Effect::ColorOverlay { color, .. } => cc(color),
             Effect::GradientOverlay { gradient, .. } => gradient.stops.iter_mut().for_each(|s| cc(&mut s.1)),
             Effect::Satin(s) => cc(&mut s.color),
@@ -585,7 +606,7 @@ fn convert_layer_colors(l: &mut Layer, from: ColorMode, to: ColorMode, t: &Trans
     }
     let _ = touched_fx;
     match &mut l.content {
-        LayerContent::Fill(f) => convert_fill(f, from, to, t),
+        LayerContent::Fill(f) => convert_fill(f, cc),
         LayerContent::Text(tx) => {
             cc(&mut tx.color);
             for r in &mut tx.runs {
@@ -594,22 +615,22 @@ fn convert_layer_colors(l: &mut Layer, from: ColorMode, to: ColorMode, t: &Trans
         }
         LayerContent::Shape(sh) => {
             if let Some(f) = &mut sh.fill {
-                convert_fill(f, from, to, t);
+                convert_fill(f, cc);
             }
             if let Some(s) = &mut sh.stroke {
-                convert_fill(&mut s.paint, from, to, t);
+                convert_fill(&mut s.paint, cc);
             }
         }
         LayerContent::Group(g) => {
             for c in &mut g.children {
-                convert_layer_colors(c, from, to, t);
+                convert_layer_colors(c, cc);
             }
         }
         _ => {}
     }
 }
 
-fn paint_colors(p: &mut FxPaint, cc: &mut impl FnMut(&mut Color)) {
+fn paint_colors(p: &mut FxPaint, cc: &mut dyn FnMut(&mut Color)) {
     match p {
         FxPaint::Color(c) => cc(c),
         FxPaint::Gradient(g) => g.stops.iter_mut().for_each(|s| cc(&mut s.1)),
@@ -620,9 +641,13 @@ fn paint_colors(p: &mut FxPaint, cc: &mut impl FnMut(&mut Color)) {
 /// Converts every pixel layer (and cached text/shape/smart pixels and fill caches) of `doc`
 /// from its profile to `dst`, switching the mode to `dst`'s colour space. Masks, alpha
 /// channels and the selection are untouched; fill, text, shape and effect colours are
-/// converted. The document is tagged with `dst`.
+/// converted. A Duotone document going to a colour space starts from its ink colours
+/// ([`ink_duotone`]). The document is tagged with `dst`.
 pub fn convert_document(doc: &mut Document, dst: &Profile, intent: Intent, bpc: bool) -> Result<()> {
     let to_mode = space_mode(dst.color_space).ok_or_else(|| EngineError::Other(format!("cannot convert to a {:?} profile", dst.color_space)))?;
+    if to_mode != ColorMode::Grayscale {
+        ink_duotone(doc);
+    }
     let src = document_profile(doc);
     let from_mode = doc.pixel_format().mode;
     let t = Transform::new(&src, dst, intent, bpc).map_err(cms_err)?;
@@ -632,7 +657,7 @@ pub fn convert_document(doc: &mut Document, dst: &Profile, intent: Intent, bpc: 
         *surf = convert_surface(surf, from_mode, f, &t);
     });
     for l in &mut doc.layers {
-        convert_layer_colors(l, from_mode, to_mode, &t);
+        convert_layer_colors(l, &mut |c| convert_color(c, from_mode, to_mode, &t));
         // Preserved PSD blocks describing colours in the old mode no longer apply.
     }
     doc.mode = to_mode;
@@ -641,6 +666,76 @@ pub fn convert_document(doc: &mut Document, dst: &Profile, intent: Intent, bpc: 
     doc.color_table = None;
     doc.duotone = None;
     Ok(())
+}
+
+/// Turns a Duotone document into the sRGB document it displays as: every gray pixel and colour
+/// value becomes its printed ink colour ([`Duotone::render`], sRGB like the inks), so converting
+/// to a colour mode keeps the inks' look, as Photoshop converts them to their equivalents.
+/// Other documents (and Duotone without inks) are left alone.
+fn ink_duotone(doc: &mut Document) {
+    if doc.mode != ColorMode::Duotone {
+        return;
+    }
+    let Some(d) = doc.duotone.take_if(|d| !d.inks.is_empty()) else { return };
+    crate::image_cmds::for_each_surface(&mut doc.layers, false, &mut |surf, _| *surf = ink_surface(surf, &d));
+    for l in &mut doc.layers {
+        convert_layer_colors(l, &mut |c| {
+            if matches!(c.mode, ColorMode::Grayscale | ColorMode::Duotone) {
+                let [r, g, b] = d.render(c.c[0]);
+                *c = Color::rgba(r, g, b, c.alpha);
+            }
+        });
+    }
+    doc.mode = ColorMode::Rgb;
+    doc.icc_profile = Some(Builtin::Srgb.profile().to_bytes());
+}
+
+/// The RGB surface of a gray surface's ink colours (same depth and alpha), one parallel pass
+/// over the tiles. Non-gray surfaces are returned unchanged.
+fn ink_surface(s: &Surface, d: &Duotone) -> Surface {
+    use rayon::prelude::*;
+    let sf = s.format();
+    if sf.mode != ColorMode::Grayscale {
+        return s.clone();
+    }
+    let to = PixelFormat { mode: ColorMode::Rgb, ..sf };
+    let (ss, ds) = (sf.channels(), to.channels());
+    let ink = |src: &[f32], out: &mut [f32]| {
+        let [r, g, b] = d.render(src.first().copied().unwrap_or(0.0));
+        for (o, v) in out.iter_mut().zip([r, g, b].into_iter().chain(src.get(1).copied())) {
+            *o = v;
+        }
+    };
+    let mut dp = vec![0.0f32; ds];
+    ink(&s.default_pixel(), &mut dp);
+    let mut out = Surface::with_default(to, &dp);
+    let tiles: Vec<_> = s.tiles().map(|(c, t)| (*c, t.clone())).collect();
+    let inked: Vec<Vec<u8>> = tiles
+        .par_iter()
+        .map(|(_, t)| {
+            let src = t.bytes();
+            let n = src.len() / sf.bytes_per_pixel().max(1);
+            let mut dst = vec![0u8; n * to.bytes_per_pixel()];
+            let (mut px, mut o) = ([0.0f32; 2], [0.0f32; 4]);
+            for i in 0..n {
+                for (k, v) in px.iter_mut().enumerate().take(ss) {
+                    *v = photocraft_color::read_sample(src, sf.sample, i * ss + k);
+                }
+                ink(&px[..ss], &mut o[..ds]);
+                for (k, v) in o.iter().enumerate().take(ds) {
+                    photocraft_color::write_sample(&mut dst, to.sample, i * ds + k, *v);
+                }
+            }
+            dst
+        })
+        .collect();
+    for ((c, _), bytes) in tiles.iter().zip(inked) {
+        let tile = out.tile_mut(*c).bytes_mut();
+        if tile.len() == bytes.len() {
+            tile.copy_from_slice(&bytes);
+        }
+    }
+    out
 }
 
 /// Image › Mode › RGB/Grayscale/CMYK/Lab through the CMS. Params: `profile` (destination,
@@ -871,7 +966,9 @@ fn color_settings(s: &mut Session, p: &Value) -> Result<Value> {
         "settings": c,
         "working": {"rgb": desc(ColorMode::Rgb), "cmyk": desc(ColorMode::Cmyk), "gray": desc(ColorMode::Grayscale)},
         "monitor": s.color.monitor().description,
-        "monitorDetected": s.color.monitor_profile.is_some(),
+        "monitorDetected": !s.color.displays.is_empty(),
+        "monitorStatus": s.color.monitor_status(),
+        "displays": s.color.display_statuses(),
     }))
 }
 
@@ -954,7 +1051,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "edit.colorSettings",
             "Color Settings…",
             ["Edit"],
-            r##"{"workingRgb":"srgb|display-p3|adobe-rgb-compat|prophoto-compat|linear-srgb|rec2020","workingCmyk":"coated-cmyk","workingGray":"sgray|gray-gamma-2.2","policyRgb":"preserve|convert|off","policyCmyk":"preserve|convert|off","policyGray":"preserve|convert|off","askOnMismatch":bool=true,"askOnPaste":bool=true,"askOnMissing":bool=false,"intent":"relative|perceptual|saturation|absolute","blendTextGamma":1.0..2.2|bool=1.45,"bpc":bool=true,"dither":bool=true,"monitorProfile":"auto|srgb|display-p3|adobe-rgb-compat|prophoto-compat|rec2020","reset":bool=false} (working spaces and the monitor profile also accept .icc paths; monitor `auto` = the main display's profile when the platform provides it, else sRGB)"##,
+            r##"{"workingRgb":"srgb|display-p3|adobe-rgb-compat|prophoto-compat|linear-srgb|rec2020","workingCmyk":"coated-cmyk","workingGray":"sgray|gray-gamma-2.2","policyRgb":"preserve|convert|off","policyCmyk":"preserve|convert|off","policyGray":"preserve|convert|off","askOnMismatch":bool=true,"askOnPaste":bool=true,"askOnMissing":bool=false,"intent":"relative|perceptual|saturation|absolute","blendTextGamma":1.0..2.2|bool=1.45,"bpc":bool=true,"dither":bool=true,"monitorProfile":"auto|srgb|display-p3|adobe-rgb-compat|prophoto-compat|rec2020","reset":bool=false} (working spaces and the monitor profile also accept .icc paths; monitor `auto` = the main display's profile when the platform provides it, else sRGB; the reply's `monitorStatus` says which profile is in use and why: source auto|manual|fallback, reason)"##,
             always,
             color_settings,
             true,
@@ -1234,6 +1331,34 @@ mod settings_tests {
         // Matching profiles never ask.
         let (_, r) = s.open_document(tagged("srgb"), None);
         assert_eq!(r["mismatch"], false);
+        // Nor does the same space in other bytes: sRGB as Photoshop embeds it (v2, 1024-entry
+        // tables) is the working sRGB, even under Convert, and the file keeps its own profile.
+        s.execute("edit.colorSettings", json!({"policyRgb": "convert"})).unwrap();
+        let mut v2 = Builtin::Srgb.profile().clone();
+        let trc = v2.trc.clone().unwrap();
+        let table = |c: &photocraft_cms::Curve| photocraft_cms::Curve::Table((0..1024).map(|i| c.eval64(f64::from(i) / 1023.0) as f32).collect());
+        v2.trc = Some([table(&trc[0]), table(&trc[1]), table(&trc[2])]);
+        v2.version = (2, 0x10);
+        let bytes = v2.with_encoded_bytes().to_bytes();
+        assert_ne!(bytes, Builtin::Srgb.profile().to_bytes());
+        let mut d = tagged("srgb");
+        d.icc_profile = Some(bytes.clone());
+        let (_, r) = s.open_document(d, None);
+        assert_eq!((r["action"].as_str(), r["mismatch"].as_bool(), r.get("ask")), (Some("kept"), Some(false), None));
+        assert_eq!(s.active().unwrap().doc.icc_profile.as_ref(), Some(&bytes));
+        // A 32-bit document in Photoshop's linear sRGB (a v2 profile recording the D65 display
+        // white) stays linear without asking, like one tagged with our own linear sRGB.
+        let mut lin = Builtin::LinearSrgb.profile().clone();
+        lin.version = (2, 0x10);
+        lin.white_point = [0.95047, 1.0, 1.08905];
+        let bytes = lin.with_encoded_bytes().to_bytes();
+        assert_ne!(bytes, Builtin::LinearSrgb.profile().to_bytes());
+        let mut d = Document::with_background("t", photocraft_doc::Size::new(8, 8), ColorMode::Rgb, SampleType::F32, Color::rgba(0.2, 0.6, 0.9, 1.0));
+        d.icc_profile = Some(bytes.clone());
+        let (_, r) = s.open_document(d, None);
+        assert_eq!((r["action"].as_str(), r.get("ask")), (Some("kept"), None));
+        assert_eq!(s.active().unwrap().doc.icc_profile.as_ref(), Some(&bytes));
+        s.execute("edit.colorSettings", json!({"policyRgb": "preserve"})).unwrap();
         // Convert to working: pixels converted and the document tagged with sRGB.
         s.execute("edit.colorSettings", json!({"policyRgb": "convert"})).unwrap();
         let (_, r) = s.open_document(tagged("adobe-rgb-compat"), None);
