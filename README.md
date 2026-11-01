@@ -52,7 +52,27 @@
 > **ArtCraft is a community of artists from all walks of life.** Digital, generative, music,
 > games &mdash; if you make things, you're one of us. **[Come say hi on Discord](https://discord.gg/artcraft).**
 
+## In this fork
+
+This is a personal fork of [storytold/photocraft](https://github.com/storytold/photocraft).
+Everything below the upstream description is upstream's work; what I have added to this fork is
+documentation and reproducible headless samples — no engine or app source code has been changed here.
+
 <p align="center">
+  <a href="samples/"><img src="samples/object-removal-shepherd-before-after.png" alt="Shepherd object removal before/after: a shepherd and staff patched out of a sheep landscape, flock intact" width="100%"></a>
+  <br>
+  <sub>Shepherd object removal, produced headlessly with <code>photocraft-cli</code> — see <a href="samples/">samples/</a> for the exact commands.</sub>
+</p>
+
+- **Shepherd object removal** — a person and staff patched out of a landscape with three feathered
+  patch passes, flock intact. Source footage attributed to its
+  [Pexels page](https://www.pexels.com/video/a-shepherd-walking-with-his-flock-of-sheep-14350944/).
+- **Selfie white-balance correction** — a warm tungsten cast cooled toward neutral, plus a gentle
+  S-curve and smart sharpen, all via `photocraft-cli` commands listed in [samples/](samples/).
+- Every sample lists the exact commands to reproduce it, so the result can be checked, not just admired.
+
+<p align="center">
+  <a href="#in-this-fork">This fork</a> ·
   <a href="#features">Features</a> ·
   <a href="#everything-in-the-box">Everything in the box</a> ·
   <a href="#psd-without-compromise">PSD</a> ·
