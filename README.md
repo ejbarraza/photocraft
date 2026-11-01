@@ -67,8 +67,6 @@ documentation and reproducible headless samples — no engine or app source code
 - **Shepherd object removal** — a person and staff patched out of a landscape with three feathered
   patch passes, flock intact. Source footage attributed to its
   [Pexels page](https://www.pexels.com/video/a-shepherd-walking-with-his-flock-of-sheep-14350944/).
-- **Selfie white-balance correction** — a warm tungsten cast cooled toward neutral, plus a gentle
-  S-curve and smart sharpen, all via `photocraft-cli` commands listed in [samples/](samples/).
 - Every sample lists the exact commands to reproduce it, so the result can be checked, not just admired.
 
 <p align="center">
